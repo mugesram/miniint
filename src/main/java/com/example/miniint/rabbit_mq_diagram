@@ -1,0 +1,58 @@
+                           ┌─────────────────────────────────────────┐
+                           │             HTTP Clients               │
+                           └─────────────────────────────────────────┘
+                                           │  (Incoming requests)
+                                           ▼
+                           ┌─────────────────────────────────────────┐
+                           │       Java HttpServer + Executor       │
+                           │  - Binds LISTEN_HOST:LISTEN_PORT       │
+                           │  - Uses newVirtualThreadPerTaskExecutor│
+                           └─────────────────────────────────────────┘
+                                           │  (Each request handled on its own virtual thread)
+                                           ▼
+                           ┌─────────────────────────────────────────┐
+                           │       ConcurrencyLimiter (dual)        │
+                           │  - RateLimiter (Resilience4j)          │
+                           │  - Semaphore enforces MAX_IN_FLIGHT    │
+                           └─────────────────────────────────────────┘
+                                   │                │
+                        Permit acquired?            No (null permit)
+                           │Yes                              │
+                           ▼                                ▼
+            ┌───────────────────────────────┐         ┌─────────────────────────┐
+            │ Mode Switch (AppConfig.MODE) │         │ HTTP 429 Too Many Req   │
+            └───────────────────────────────┘         └─────────────────────────┘
+               │                          │
+ Mode HTTP_PROXY│                          │Mode RABBITMQ
+               ▼                          ▼
+ ┌─────────────────────────┐   ┌────────────────────────────────────────┐
+ │ProxyHandler.ProxyToHttp │   │      ProxyHandler.HttpToMq             │
+ │- Streams request body   │   │- Streams request body                  │
+ │- Calls HttpUpstream     │   │- Borrows channel from ChannelPool      │
+ └─────────────────────────┘   │- Publishes to RabbitMQ (streaming)     │
+        │                      │- Awaits async publisher confirm        │
+        ▼                      └────────────────────────────────────────┘
+ ┌─────────────────────────┐             │
+ │ HttpUpstreamClient      │             ▼
+ │ - HttpClient w/ CB      │   ┌───────────────────────────────────────┐
+ │ - CircuitBreaker (Res4j)│   │ RabbitMqPublisher                     │
+ └─────────────────────────┘   │ - Shared Connection (long-lived)      │
+        │                      │ - ChannelPool (bounded, e.g., 500)    │
+        ▼                      │ - Async confirms via CompletableFuture│
+ ┌─────────────────────────┐   └───────────────────────────────────────┘
+ │Upstream HTTP Server     │                │
+ └─────────────────────────┘                ▼
+                                           ┌────────────────────────────────────────┐
+                                           │ RabbitMQ Broker                        │
+                                           │ - Exchange (direct/topic/stream)       │
+                                           │ - Quorum/Stream queues (sharded)       │
+                                           └────────────────────────────────────────┘
+
+Responses back to client:
+* HTTP mode: upstream status/body piped directly to HttpExchange response (zero-copy).
+* RabbitMQ mode: return 202 Accepted once publish confirm succeeds (or 500 on failure).
+
+Backpressure paths:
+- Rate/semaphore limit → 429
+- Channel pool timeout → release permit + 429
+- Circuit breaker open → 503

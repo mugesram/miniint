@@ -1,0 +1,95 @@
+[ConsumerApp bootstrap]
+│
+├─ parse config (`AppConfig.fromEnvAndArgs`, env keys like CONSUME_QUEUES, DEAD_LETTER_QUEUE, consumer backoff/retry values)
+├─ create virtual-thread executor (`newVirtualThreadPerTaskExecutor`)
+├─ create `ConcurrencyLimiter` (max in-flight, acquire timeout, rate limit)
+├─ init `HttpUpstreamClient` (timeout, circuit breaker 50% failures, 5s slow threshold)
+└─ instantiate `RabbitMqConsumerTask`, register shutdown hook, and `start()` it
+
+[RabbitMqConsumerTask.runLoop]
+│
+└─ for each queue in `consumeQueues`:
+     ├─ `basicGet(queue, autoAck=false)` until empty
+     ├─ for each delivery:
+     │     ├─ ensure limiter permit (otherwise `basicNack` + requeue)
+     │     ├─ `forwardToHttp`: rebuild method/path, send via upstream client (circuit breaker around HTTP/timeout)
+     │     │     ├─ success (2xx) → `basicAck`
+     │     │     └─ failure / exception → `retryOrDeadLetter`
+     │     └─ catch exceptions → log + `retryOrDeadLetter`
+     │
+     └─ if no deliveries, sleep `consumerPollIntervalMs`
+
+[retryOrDeadLetter]
+│
+├─ read `retryCount` header (default 0) → increment
+├─ if `nextRetry <= consumerMaxRetries`:
+│     ├─ sleep `consumerBaseBackoffMs * 2^(retryCount-1)` (capped by `consumerMaxBackoffMs`)
+│     ├─ publish back to original queue with updated `retryCount`
+│     └─ `basicAck` original message
+└─ else:
+      ├─ publish to `deadLetterQueue` (same headers/body)
+      └─ `basicAck` original
+
+[circuit breaker / HTTP path]
+│
+├─ every upstream call executed via Resilience4j CB with:
+│     ├─ `minimumNumberOfCalls=10`
+│     ├─ `failureRateThreshold=50%`
+│     ├─ `slowCallDurationThreshold=5s`, `slowCallRateThreshold=80%`
+│     ├─ `waitDurationInOpenState=30s`, `permittedNumberOfCallsInHalfOpenState=5`
+│
+└─ failures/timeouts increment CB metrics and trigger retries when the loop hears the exception
+
+[Operational notes]
+- Channel reconnect via `ensureChannel()` with automatic recovery and `basicQos(prefetch)`
+- Rate/concurrency limits keep HTTP requests bounded even during retries
+- Shutdown hook closes consumer and executor
+
+Let me know if you want this converted into PlantUML or another visual format.[ConsumerApp bootstrap]
+│
+├─ parse config (`AppConfig.fromEnvAndArgs`, env keys like CONSUME_QUEUES, DEAD_LETTER_QUEUE, consumer backoff/retry values)
+├─ create virtual-thread executor (`newVirtualThreadPerTaskExecutor`)
+├─ create `ConcurrencyLimiter` (max in-flight, acquire timeout, rate limit)
+├─ init `HttpUpstreamClient` (timeout, circuit breaker 50% failures, 5s slow threshold)
+└─ instantiate `RabbitMqConsumerTask`, register shutdown hook, and `start()` it
+
+[RabbitMqConsumerTask.runLoop]
+│
+└─ for each queue in `consumeQueues`:
+     ├─ `basicGet(queue, autoAck=false)` until empty
+     ├─ for each delivery:
+     │     ├─ ensure limiter permit (otherwise `basicNack` + requeue)
+     │     ├─ `forwardToHttp`: rebuild method/path, send via upstream client (circuit breaker around HTTP/timeout)
+     │     │     ├─ success (2xx) → `basicAck`
+     │     │     └─ failure / exception → `retryOrDeadLetter`
+     │     └─ catch exceptions → log + `retryOrDeadLetter`
+     │
+     └─ if no deliveries, sleep `consumerPollIntervalMs`
+
+[retryOrDeadLetter]
+│
+├─ read `retryCount` header (default 0) → increment
+├─ if `nextRetry <= consumerMaxRetries`:
+│     ├─ sleep `consumerBaseBackoffMs * 2^(retryCount-1)` (capped by `consumerMaxBackoffMs`)
+│     ├─ publish back to original queue with updated `retryCount`
+│     └─ `basicAck` original message
+└─ else:
+      ├─ publish to `deadLetterQueue` (same headers/body)
+      └─ `basicAck` original
+
+[circuit breaker / HTTP path]
+│
+├─ every upstream call executed via Resilience4j CB with:
+│     ├─ `minimumNumberOfCalls=10`
+│     ├─ `failureRateThreshold=50%`
+│     ├─ `slowCallDurationThreshold=5s`, `slowCallRateThreshold=80%`
+│     ├─ `waitDurationInOpenState=30s`, `permittedNumberOfCallsInHalfOpenState=5`
+│
+└─ failures/timeouts increment CB metrics and trigger retries when the loop hears the exception
+
+[Operational notes]
+- Channel reconnect via `ensureChannel()` with automatic recovery and `basicQos(prefetch)`
+- Rate/concurrency limits keep HTTP requests bounded even during retries
+- Shutdown hook closes consumer and executor
+
+Let me know if you want this converted into PlantUML or another visual format.
